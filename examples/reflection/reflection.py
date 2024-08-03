@@ -1,8 +1,15 @@
-from utils import set_env, get_llm
+# https://langchain-ai.github.io/langgraph/cloud/deployment/setup/
+
+from utils import set_env, get_llm, save_graph_image
 import os
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.prompts import PromptTemplate
+from langgraph.graph import END, START
+from langgraph.checkpoint import MemorySaver
+from langgraph.graph.state import CompiledStateGraph
 
+larger_model = "llama-3.1-70b-versatile"
+smaller_model = "llama-3.1-8b-instant"
 # Set the environment
 os.environ['LANGCHAIN_API_KEY'] = ''
 set_env()
@@ -17,7 +24,7 @@ If the user provides critique, respond with a revised version of your previous a
 </essay_topic>"""
 
 essay_prompt: PromptTemplate = PromptTemplate(name="Essay Writing prompt", template=essay_prompt_msg)
-student = get_llm(vendor='groq', model='llama-3.1-70b-versatile', max_tokens=2048, temperature=1.0)
+student = get_llm(vendor='groq', model=smaller_model, max_tokens=4096, temperature=0.7)
 essay_writing = essay_prompt | student
 essay_writing.name = "Essay Writing"
 
@@ -46,7 +53,7 @@ Provide detailed recommendations, including requests for length, depth, style, e
 </essay>"""
 
 critic_prompt: PromptTemplate = PromptTemplate(name="Essay Critic prompt", template=critic_prompt_msg)
-teacher = get_llm(vendor='groq', model='llama-3.1-70b-versatile', max_tokens=512, temperature=0.2)
+teacher = get_llm(vendor='groq', model=larger_model, max_tokens=2048, temperature=0.2)
 
 essay_critique = critic_prompt | teacher
 essay_critique.name = "Essay Critique"
@@ -91,10 +98,34 @@ essay_refiner.name = "Essay Refinement"
 #     print(msg, end='')
 #     count+=1
 
-translater = get_llm(vendor='groq', model='llama-3.1-70b-versatile', max_tokens=4096, temperature=0.2)
-translation_prompt_msg = """You are a language assistant tasked with translating the essay into another language. \
-Translate the following texts (essay, essay's critique and the refined essay) into Simplified Chinese. Put your \
-output into the corresponding sections.
+# translater = get_llm(vendor='groq', model=smaller_model, max_tokens=4096, temperature=0.2)
+translator = get_llm(vendor='openai', model="gpt-4o-mini", max_tokens=8192, temperature=0.2)
+translation_prompt_msg = """You are a highly skilled language assistant specializing in translation. Your task is to translate the following essay-related content from its original language into {to}. Please maintain the tone, style, and nuances of the original text while ensuring the translation is natural and fluent in the target language.
+
+Instructions:
+1. Translate the original essay, its critique, and the refined essay.
+2. Preserve the formatting and structure of each section.
+3. Ensure that technical terms, idiomatic expressions, and cultural references are accurately conveyed.
+4. Maintain the <essay>, <critique>, and <refined_essay> tags in your response.
+
+Please provide your translations in the following format:
+
+Translated Essay:
+<essay>
+[Your translation of the original essay goes here]
+</essay>
+
+Translated Critique:
+<critique>
+[Your translation of the critique goes here]
+</critique>
+
+Translated Refined Essay:
+<refined_essay>
+[Your translation of the refined essay goes here]
+</refined_essay>
+
+Original content for translation:
 
 Essay:
 <essay>
@@ -112,7 +143,7 @@ Refined Essay:
 </refined_essay>
 """
 translation_prompt = PromptTemplate(name="Translation prompt", template=translation_prompt_msg)
-translating = translation_prompt | translater
+translating = translation_prompt | translator
 translating.name = "Translation"
 
 # count = 0
@@ -133,22 +164,75 @@ from langgraph.graph import StateGraph
 # Define Agent State
 from typing import TypedDict, Annotated
 class EssayAgentState(TypedDict):
-    task: Annotated[str, "The description of the task, e.g. 'Write an essay about why nuclear weapons can't resolve conflicts'"] = ''
-    essay: Annotated[str, "The essay written by the student"] = ''
-    critique: Annotated[str, "The critique provided by the teacher"] = ''
-    iterate: Annotated[int, "The number of iterations to refine the essay"] = 0
+    task: Annotated[str, "The specific essay prompt or writing assignment given to the student"]
+    essay: Annotated[str, "The current version of the essay written by the student"]
+    critique: Annotated[str, "Detailed feedback and suggestions provided by the teacher on the current essay"]
+    prior_essay: Annotated[str, "The previous version of the essay, if any, used as a reference for improvements"]
+    translated_essay: Annotated[str, "The final essay translated into a specified target language"]
+    iterate: Annotated[int, "The current number of revision iterations completed"]
+    max_iterate: Annotated[int, "The maximum number of revision iterations allowed for the essay"]
 
 # Define a coroutine function to generate the essay
 async def write_essay_node(state: EssayAgentState) -> EssayAgentState:
+    new_state = EssayAgentState(**state)
     if state.get('critique') is not None and state.get('essay') is not None:
         content = await essay_refiner.ainvoke({'topic': state['task'], 'essay': state['essay'], 'critique': state['critique']})
+        prior_essay = state['essay']
+        new_state['prior_essay'] = prior_essay
     else:
         content = await essay_writing.ainvoke({'topic': state['task']})
-    essay = content['content']
-    return {**state, 'essay': essay}
+    essay = content.content
+    new_state['essay'] = essay
+    new_state['iterate'] += 1
+    return {**new_state}
+
+async def critique_essay_node(state: EssayAgentState) -> EssayAgentState:
+    content = await essay_critique.ainvoke({'essay_topic': state['task'], 'essay': state['essay']})
+    critique = content.content
+    return {**state, 'critique': critique}
+
+async def translate_essay_node(state: EssayAgentState) -> EssayAgentState:
+    content = await translating.ainvoke({'essay': state['prior_essay'], 'critique': state['critique'], 'refined_essay': state['essay'], 'to': 'Simplified Chinese'})
+    translation = content.content
+    return {**state, 'translated_essay': translation}
+
+
+async def move_on(state: EssayAgentState) -> bool:
+    return state['iterate'] < state['max_iterate']
+
+async def get_assistant()->CompiledStateGraph:
+    graph_builder = StateGraph(state_schema=EssayAgentState)
+    graph_builder.add_node('write_essay', write_essay_node)
+    graph_builder.add_node('critique_essay', critique_essay_node)
+    graph_builder.add_node('translate_essay', translate_essay_node)
+    graph_builder.add_edge(start_key=START, end_key='write_essay')
+    graph_builder.add_conditional_edges(source='write_essay', path=move_on, path_map={True: 'critique_essay', False: 'translate_essay'})
+    graph_builder.add_edge(start_key='critique_essay', end_key='write_essay')
+    graph_builder.add_edge(start_key='translate_essay', end_key=END)
+    graph = graph_builder.compile(checkpointer=MemorySaver())
+    save_graph_image(graph=graph, dest_png_path="img/essay_agent_graph.png")
+    return graph
 
 async def test(essay_topic: str):
-    await write_essay_node({'task': essay_topic})
+    graph :CompiledStateGraph = await get_assistant()
+    initial_state = EssayAgentState(task=essay_topic, essay='', critique='', iterate=0, max_iterate=2)
+    config = {"configurable": {"thread_id": 1}}
+    # response = await graph.ainvoke(input={'task': essay_topic}, config={"configurable": {"thread_id": 1}})
+    prior_output = {}
+    async for event in graph.astream_events(input=initial_state, config=config, version='v2'):
+        # print(event)
+        # print(event['data'].get('output', ''))
+        if event.get('event') == "on_chain_end":
+            curr_state = await graph.aget_state(config)
+            output = curr_state.values
+            if prior_output != output:
+                print(output)
+                print("\n\n\n")
+                prior_output = output
+        #     for k, v in event['data']['output'].items():
+        #         print(f"{k}:\n{v}")
+        #     print("\n\n\n")
+    pass
 
 from asyncio import run, gather, create_task
 if __name__ == '__main__':
