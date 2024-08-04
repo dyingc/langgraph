@@ -11,6 +11,8 @@ from langgraph.graph.graph import CompiledGraph
 from IPython.display import Image
 from streamlit import stop
 from langchain_core.pydantic_v1 import SecretStr
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.language_models.llms import BaseLLM
 
 
 def set_env():
@@ -54,7 +56,7 @@ def get_llm(
     top_p: float = 1.0,
     top_k: float|None = None,
     frequency_penalty: float|None = None,
-) -> Runnable:
+) -> BaseChatModel|BaseLLM:
     match vendor:
         case "groq":
             if model is None or model.strip() == "":
@@ -265,10 +267,7 @@ def save_graph_image(graph: CompiledGraph, dest_png_path: str):
         raise ValueError(
             f"Could not create directory for {os.path.dirname(dest_png_path)}!"
         )
-    png_data = Image(data=graph.get_graph().draw_png(dest_png_path))
-    # with open(dest_png_path, 'wb') as f:
-    #     f.write(png_data.data)
-
+    graph.get_graph().draw_png(dest_png_path)
 
 # p = read_prompt_from_jsonl(jsonl_file="data/jailbreak_judge.jsonl", prompt_name="openai_concise_jailbreak_judge")
 # print(p)
