@@ -23,13 +23,18 @@ def set_env():
         # a function to test the connectivity to the proxy
         def get_proxy():
             ora_proxy = "http://www-proxy-ash7.us.oracle.com:80"
+            testing_url = "https://www.google.com"
             import requests
 
             try:
-                requests.get(ora_proxy, timeout=1)
-                return ora_proxy
+                requests.get(testing_url, timeout=1)
+                return "" # prefer non-proxy - as long as the testing_url is reachable
             except Exception as e:
-                return ""
+                try:
+                    requests.get(ora_proxy, timeout=1)
+                    return ora_proxy
+                except Exception as e:
+                    return ""
 
         proxy = get_proxy()
         os.environ["http_proxy"] = proxy
