@@ -188,7 +188,11 @@ from langgraph.prebuilt import ToolNode
 
 # Define a function to run the generated queries
 def run_queries(search_queries: list[str], **kwargs):
-    """Run the generated queries."""
+    """
+    Run the generated queries.
+    Args:
+        search_queries (list[str]): The search queries to run. This is defined in the AnswerQuestion model.
+    """
     return tavily_tool.batch([{"query": query} for query in search_queries])
 
 # Create a tool node with structured tools for running queries
@@ -211,6 +215,8 @@ builder = MessageGraph()
 builder.add_node("draft", first_responder.respond)
 builder.add_node("execute_tools", tool_node)
 builder.add_node("revise", revisor.respond)
+
+from reflexion_utils import ReflectionUtils
 
 # Define edges between nodes in the graph
 builder.add_edge("draft", "execute_tools")
