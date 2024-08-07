@@ -5,7 +5,7 @@ import copy
 from json import tool
 from unittest import result
 from unittest.mock import Base
-from typing import List, Annotated, cast, Optional, Literal, Dict
+from typing import Any, List, Annotated, cast, Optional, Literal, Dict
 from enum import Enum
 from groq import APIError, BadRequestError
 from langchain_core.pydantic_v1 import BaseModel, validator, Field
@@ -26,6 +26,7 @@ from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_community.utilities.tavily_search import TavilySearchAPIWrapper
 from langgraph.prebuilt import ToolNode
 from langgraph.graph import START, END, MessageGraph
+from more_itertools import first
 from pydantic.v1.error_wrappers import ValidationError as ValidationError_Wrapper
 from pydantic import SecretStr, ValidationError
 from pydantic.v1.types import SecretStr as SecretStr_v1
@@ -90,37 +91,37 @@ class AI_QAResponse(BaseModel):
         ),
     ]
 
-    # confidence_score: Annotated[
-    #     float,
-    #     Field(
-    #         description="A self-assessed score (0.0 to 1.0) indicating the AI's confidence in the accuracy and completeness of its initial response, guiding the need for additional research.",
-    #         ge=0.0,
-    #         le=1.0,
-    #     ),
-    # ]
+    confidence_score: Annotated[
+        float,
+        Field(
+            description="A self-assessed score (0.0 to 1.0) indicating the AI's confidence in the accuracy and completeness of its initial response, guiding the need for additional research.",
+            ge=0.0,
+            le=1.0,
+        ),
+    ]
 
-    # priority_topics: Annotated[
-    #     List[str],
-    #     Field(
-    #         description="A list of 2-3 key topics or areas from the response that would benefit most from additional research and verification.",
-    #         min_items=2,
-    #         max_items=3,
-    #     ),
-    # ]
+    priority_topics: Annotated[
+        List[str],
+        Field(
+            description="A list of 2-3 key topics or areas from the response that would benefit most from additional research and verification.",
+            min_items=2,
+            max_items=3,
+        ),
+    ]
 
-    # @validator("confidence_score")
-    # def validate_confidence_score(cls, v):
-    #     if v < 0.0 or v > 1.0:
-    #         raise ValueError(
-    #             "The confidence score must be a value between 0.0 and 1.0."
-    #         )
-    #     return v
+    @validator("confidence_score")
+    def validate_confidence_score(cls, v):
+        if v < 0.0 or v > 1.0:
+            raise ValueError(
+                "The confidence score must be a value between 0.0 and 1.0."
+            )
+        return v
 
-    # @validator("priority_topics")
-    # def validate_priority_topics(cls, v):
-    #     if len(v) < 2 or len(v) > 3:
-    #         raise ValueError("The number of priority topics must be between 2 and 3.")
-    #     return v
+    @validator("priority_topics")
+    def validate_priority_topics(cls, v):
+        if len(v) < 2 or len(v) > 3:
+            raise ValueError("The number of priority topics must be between 2 and 3.")
+        return v
 
     @validator("suggested_queries")
     def validate_suggested_queries(cls, v):
@@ -144,23 +145,8 @@ class AI_QARevision(AI_QAResponse):
         ),
     ]
 
-
-# class EssayWritingState(BaseModel):
-#     messages: List[BaseMessage] = Field(
-#         List[BaseMessage],
-#         description="All the messages that form the state of the MessageGraph",
-#     )
-#     iter_num: Annotated[int, Field(description="The number of iterations in the MessageGraph", default=0)] = 0
-#     MAX_ITERATIONS: Annotated[int, Field(description="The maximum number of iterations in the MessageGraph", default=Literal[5])] = 5
-
-
 class ReflectionUtils:
-
-    draft_prompt_template = ChatPromptTemplate(
-        name="draft_prompt",
-        messages=[
-            SystemMessage(
-                content="""You are an expert researcher with exceptional analytical skills and a keen sense for thorough investigation. \
+    system_prompt = """You are an expert researcher with exceptional analytical skills and a keen sense for thorough investigation. \
 Your task is to respond to the given question with a well-structured, comprehensive essay. Follow these steps:
 1. Analyze the question carefully, identifying key components and any implicit assumptions.
 2. Outline the main points you plan to cover in your response, ensuring a logical flow of ideas.
@@ -184,13 +170,13 @@ Current time: {current_time}
     c) Areas where the answer could be more comprehensive
     d) Possible biases or assumptions made
 4. Based on your critique, suggest some specific search queries that could help address the identified weaknesses and improve the answer. Format each query as a bullet point."""
-            ),
-            MessagesPlaceholder(variable_name="messages"),
-            HumanMessage(
-                content="""<reminder>Reflect on the users original question, the actions you've taken thus far and the materials provided by some external tools. Respond with function: {function_name}</reminder>"""
-            ),
-        ],
-    )
+    last_prompt = """<reminder>Reflect on the users original question, the actions you've taken thus far and the materials provided by some external tools. Respond with function: {function_name}</reminder>"""
+    system_prompt = """You are expert researcher.
+Current time: {current_time}
+
+1. {first_instruction}
+2. Reflect and critique your answer. Be severe to maximize improvement.
+3. Recommend search queries to research information and improve your answer."""    
 
     revise_instruction = """Revise your previous answer using the new information and self-reflection. Follow these guidelines carefully:
 
@@ -246,21 +232,33 @@ Remember, your goal is to provide a concise, well-supported, and accurate respon
                     max_tokens=4096,
                 ),
             )
-            # llm = cast(BaseChatModel, get_llm(vendor="groq", model="llama-3.1-8b-instant", temperature=0.5, max_tokens=4096))
             llm.name = "Groq Researcher"
+
+        # We have variables in the prompts and then we need to use the following style to make those variables assignable.
+        self.draft_prompt_template = ChatPromptTemplate.from_messages(
+            [
+                ("system", self.system_prompt),
+                MessagesPlaceholder(variable_name="messages"),
+                # MessagesPlaceholder(variable_name="revise_instructions"),
+                ("human", self.last_prompt),
+            ]
+        )
+        self.draft_prompt_template.name = "draft_prompt_template"
+
         current_time = lambda: datetime.datetime.now().isoformat()
-        # self.draft_chain:RunnableSequence  = None
         self.draft_chain: RunnableSerializable = self.draft_prompt_template.partial(
             first_instruction=first_instruction,
             current_time=current_time,
+            # revise_instructions=[],
             function_name=AI_QAResponse.__name__,
         ) | llm.bind_tools(tools=[AI_QAResponse])
         self.draft_chain.name = "Draft Chain"
         self.draft_validator = draft_validator
 
         self.revise_chain: RunnableSerializable = self.draft_prompt_template.partial(
-            first_instruction=self.revise_instruction.format(word_num=word_num),
+            first_instruction=first_instruction,
             current_time=current_time,
+            # revise_instructions=[HumanMessage(self.revise_instruction.format(word_num=word_num))],
             function_name=AI_QARevision.__name__,
         ) | llm.bind_tools(tools=[AI_QARevision])
         self.revise_chain.name = "Revise Chain"
@@ -322,14 +320,25 @@ Remember, your goal is to provide a concise, well-supported, and accurate respon
             f"Failed to validate the response after {self.try_num} attempts!"
         )
 
-    def run_quries(self, suggested_queries: List[str], **kwargs) -> List[str]:
+    def run_quries(self, suggested_queries: List[str], **kwargs) -> List[Dict[str, object]]:
         """
         Run the suggested queries and return the results.
         """
-        results = self.tavily.batch(
+        responses = self.tavily.batch(
             inputs=[{"query": query} for query in suggested_queries]
         )
-        return results
+        results : List[Dict[str, object]] = []
+        for q, r in zip(suggested_queries, responses):
+            result = dict()
+            result['query'] = q
+            result['answers'] = []
+            for _, r0 in enumerate(r):
+                d = {}
+                d['url'] = r0['url']
+                d['content'] = r0['content']
+                result['answers'].append(d)
+            results.append(result)
+        return results # [ToolMessage(content=repr(r), tool_call_id=str(uuid.uuid4())) for r in results]
 
     def research(self, messages: List[BaseMessage]) -> List[BaseMessage]:
         """
@@ -407,7 +416,7 @@ Remember, your goal is to provide a concise, well-supported, and accurate respon
             A string that indicates the next node in the graph.
         """
         count = 0
-        thredshold = 4
+        thredshold = 3
         for m in reversed(messages):
             if m.type not in ["ai", "tool"]:
                 count += 1
@@ -431,12 +440,17 @@ def main():
     revise_validator = PydanticToolsParser(
         name="AIResponse Validator", tools=[AI_QARevision]
     )
+    llm = get_llm(vendor="openai", model="gpt-4o-mini", temperature=0.5, max_tokens=4096)
+    llm = get_llm(vendor="groq", model="llama-3.1-70b-versatile", temperature=0.5, max_tokens=4096)
+    llm = get_llm(vendor="groq", model="llama-3.1-8b-instant", temperature=0.5, max_tokens=4096)
+    llm = cast(BaseChatModel, llm)
+
     reflection = ReflectionUtils(
         first_instruction="Write an essay on the following topic with about 300 words.",
         TAVILY_API_KEY=SecretStr_v1(os.environ["TAVILY_API_KEY"]),
         draft_validator=draft_validator,
         revise_validator=revise_validator,
-        llm=cast(BaseChatModel, get_llm(vendor="openai", model="gpt-4o-mini", temperature=0.5, max_tokens=4096)),
+        llm=llm,
     )
     messages: List[BaseMessage] = [
         HumanMessage(content="What is cryptocurrency and how does it work?")
