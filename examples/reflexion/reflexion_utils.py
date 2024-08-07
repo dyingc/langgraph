@@ -1,10 +1,13 @@
 from abc import abstractmethod
 import datetime
+import uuid
+import copy
 from json import tool
 from unittest import result
 from unittest.mock import Base
-from typing import List, Annotated, cast, Optional, Literal
+from typing import List, Annotated, cast, Optional, Literal, Dict
 from enum import Enum
+from groq import APIError, BadRequestError
 from langchain_core.pydantic_v1 import BaseModel, validator, Field
 from langchain_core.output_parsers import PydanticToolsParser
 from langchain_core.messages import (
@@ -87,37 +90,37 @@ class AI_QAResponse(BaseModel):
         ),
     ]
 
-    confidence_score: Annotated[
-        float,
-        Field(
-            description="A self-assessed score (0.0 to 1.0) indicating the AI's confidence in the accuracy and completeness of its initial response, guiding the need for additional research.",
-            ge=0.0,
-            le=1.0,
-        ),
-    ]
+    # confidence_score: Annotated[
+    #     float,
+    #     Field(
+    #         description="A self-assessed score (0.0 to 1.0) indicating the AI's confidence in the accuracy and completeness of its initial response, guiding the need for additional research.",
+    #         ge=0.0,
+    #         le=1.0,
+    #     ),
+    # ]
 
-    priority_topics: Annotated[
-        List[str],
-        Field(
-            description="A list of 2-3 key topics or areas from the response that would benefit most from additional research and verification.",
-            min_items=2,
-            max_items=3,
-        ),
-    ]
+    # priority_topics: Annotated[
+    #     List[str],
+    #     Field(
+    #         description="A list of 2-3 key topics or areas from the response that would benefit most from additional research and verification.",
+    #         min_items=2,
+    #         max_items=3,
+    #     ),
+    # ]
 
-    @validator("confidence_score")
-    def validate_confidence_score(cls, v):
-        if v < 0.0 or v > 1.0:
-            raise ValueError(
-                "The confidence score must be a value between 0.0 and 1.0."
-            )
-        return v
+    # @validator("confidence_score")
+    # def validate_confidence_score(cls, v):
+    #     if v < 0.0 or v > 1.0:
+    #         raise ValueError(
+    #             "The confidence score must be a value between 0.0 and 1.0."
+    #         )
+    #     return v
 
-    @validator("priority_topics")
-    def validate_priority_topics(cls, v):
-        if len(v) < 2 or len(v) > 3:
-            raise ValueError("The number of priority topics must be between 2 and 3.")
-        return v
+    # @validator("priority_topics")
+    # def validate_priority_topics(cls, v):
+    #     if len(v) < 2 or len(v) > 3:
+    #         raise ValueError("The number of priority topics must be between 2 and 3.")
+    #     return v
 
     @validator("suggested_queries")
     def validate_suggested_queries(cls, v):
@@ -273,21 +276,48 @@ Remember, your goal is to provide a concise, well-supported, and accurate respon
         """
         Write the first draft of the essay and provide a self-reflection on the writing process.
         """
+        cloned_messages = copy.copy(messages)
         for attempt in range(self.try_num):
             config: RunnableConfig = {"tags": [f"attempt:{attempt}"]}
-            response = self.draft_chain.invoke(
-                input={"messages": messages}, config=config
-            )
             try:
-                self.draft_validator.invoke(input=response)
-                return response
-            except ValidationError_Wrapper as e:
-                messages.append(response)
+                response = self.draft_chain.invoke(
+                    input={"messages": cloned_messages}, config=config
+                )
+            except Exception as e:
                 validation_message = ToolMessage(
-                    content=f"Validation Error: {repr(e.errors())}\n\nRegenerating the response to fix the above validation error!",
+                    content=f"The AI tried to generate a response but got the following error:\n\n{repr(e)}\n\nRegenerating the response to fix the above generation error!",
+                    tool_call_id=str(uuid.uuid4()),
+                )
+                cloned_messages.append(validation_message)
+                continue
+            try:
+                if len(self.draft_validator.invoke(input=response)) != 0:
+                    return response
+                else:
+                    raise ValidationError("The response is not a valid JSON object!")
+            except ValidationError_Wrapper as e:
+                cloned_messages.append(response)
+                tool_schemas = '\n\n'.join([t.schema_json() for t in self.draft_validator.tools])
+                validation_message = ToolMessage(
+                    content=f"Validation Error: {repr(e.errors())}\n\nPay close attention to the schema:\n{tool_schemas}\n\nRegenerating the response to fix the above validation error!",
                     tool_call_id=response.tool_calls[0]["id"],
                 )
-                messages.append(validation_message)
+                cloned_messages.append(validation_message)
+            except Exception as e:
+                cloned_messages.append(response)
+                tool_schemas = '\n\n'.join([t.schema_json() for t in self.draft_validator.tools])
+                error_msg = repr(e)
+                if isinstance(e, BadRequestError):
+                    error_msg = cast(BadRequestError, e)
+                    error_msg = cast(Dict, error_msg.body)
+                    error_msg = repr(error_msg.get("error", error_msg))
+                    
+                validation_message = ToolMessage(
+                    content=f"The AI tried to generate a response but got the following error:\n\n{error_msg}\n\nRegenerating the response to fix the above generation error!", # Consider to remove unnecessary tags.
+                    tool_call_id=response.tool_calls[0]["id"],
+                )
+                cloned_messages.append(validation_message)
+
         raise ValueError(
             f"Failed to validate the response after {self.try_num} attempts!"
         )
@@ -320,27 +350,52 @@ Remember, your goal is to provide a concise, well-supported, and accurate respon
         """
         Revise the answer based on the feedback from the reflection and research.
         """
+        cloned_messages = copy.copy(messages)
         results:List[BaseMessage] = []
         revise_message = HumanMessage(content=self.revise_instruction)
-        messages.append(revise_message)
+        cloned_messages.append(revise_message)
         results.append(revise_message)
         for attempt in range(self.try_num):
             config: RunnableConfig = {"tags": [f"attempt:{attempt}"]}
-            response = self.revise_chain.invoke(
-                input={"messages": messages}, config=config
-            )
             try:
-                self.revise_validator.invoke(input=response)
-                results.append(response)
-                return results
+                response = self.revise_chain.invoke(
+                    input={"messages": cloned_messages}, config=config
+                )
+            except Exception as e:
+                error_msg = repr(e)
+                if isinstance(e, BadRequestError):
+                    error_msg = cast(BadRequestError, e)
+                    error_msg = cast(Dict, error_msg.body)
+                    error_msg = repr(error_msg.get("error", error_msg))
+                validation_message = ToolMessage(
+                    content=f"The AI tried to generate a response but got the following error:\n\n{error_msg}\n\nRegenerating the response to fix the above generation error!", # Consider to remove unnecessary tags.
+                    tool_call_id=str(uuid.uuid4()),
+                )
+                cloned_messages.append(validation_message)
+                continue
+            try:
+                if len(self.revise_validator.invoke(input=response)) != 0:
+                    results.append(response)
+                    return results
+                else:
+                    raise ValidationError("The response is not a valid JSON object!")
             except ValidationError_Wrapper as e:
                 # No need to append response or validation_message to the final results list if the validation fails
-                messages.append(response)
+                cloned_messages.append(response)
+                tool_schemas = '\n\n'.join([t.schema_json() for t in self.revise_validator.tools])
                 validation_message = ToolMessage(
-                    content=f"Validation Error: {repr(e.errors())}\n\nRegenerating the response to fix the above validation error!",
+                    content=f"Validation Error: {repr(e.errors())}\n\nPay close attention to the schema:\n{tool_schemas}\n\nRegenerating the response to fix the above validation error!",
                     tool_call_id=response.tool_calls[0]["id"],
                 )
-                messages.append(validation_message)
+                cloned_messages.append(validation_message)
+            except Exception as e:
+                cloned_messages.append(response)
+                tool_schemas = '\n\n'.join([t.schema_json() for t in self.revise_validator.tools])
+                validation_message = ToolMessage(
+                    content=f"Validation Error: {repr(e)}\n\nPay close attention to the schema:\n{tool_schemas}\n\nRegenerating the response to fix the above validation error!",
+                    tool_call_id=response.tool_calls[0]["id"],
+                )
+                cloned_messages.append(validation_message)
         raise ValueError(f"Failed to validate the response after {self.try_num} attempts!")
 
     def finish_revise(self, messages: List[BaseMessage]) -> Literal["__end__", "research"]:
@@ -357,7 +412,7 @@ Remember, your goal is to provide a concise, well-supported, and accurate respon
             if m.type not in ["ai", "tool"]:
                 count += 1
                 if count >= thredshold:
-                    return "__end__"
+                    return END
         return "research"
 
 
