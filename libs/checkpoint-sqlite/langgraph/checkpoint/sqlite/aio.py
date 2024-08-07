@@ -1,7 +1,6 @@
 import asyncio
 import functools
-from contextlib import AbstractAsyncContextManager
-from types import TracebackType
+from contextlib import asynccontextmanager
 from typing import (
     Any,
     AsyncIterator,
@@ -15,10 +14,10 @@ from typing import (
 
 import aiosqlite
 from langchain_core.runnables import RunnableConfig
-from typing_extensions import Self
 
 from langgraph.checkpoint.base import (
     BaseCheckpointSaver,
+    ChannelVersions,
     Checkpoint,
     CheckpointMetadata,
     CheckpointTuple,
@@ -45,7 +44,7 @@ def not_implemented_sync_method(func: T) -> T:
     return wrapper
 
 
-class AsyncSqliteSaver(BaseCheckpointSaver, AbstractAsyncContextManager):
+class AsyncSqliteSaver(BaseCheckpointSaver):
     """An asynchronous checkpoint saver that stores checkpoints in a SQLite database.
 
     This class provides an asynchronous interface for saving and retrieving checkpoints
@@ -94,10 +93,10 @@ class AsyncSqliteSaver(BaseCheckpointSaver, AbstractAsyncContextManager):
         >>> builder.add_node("add_one", lambda x: x + 1)
         >>> builder.set_entry_point("add_one")
         >>> builder.set_finish_point("add_one")
-        >>> memory = AsyncSqliteSaver.from_conn_string("checkpoints.sqlite")
-        >>> graph = builder.compile(checkpointer=memory)
-        >>> coro = graph.ainvoke(1, {"configurable": {"thread_id": "thread-1"}})
-        >>> asyncio.run(coro)
+        >>> async with AsyncSqliteSaver.from_conn_string("checkpoints.db") as memory:
+        >>>     graph = builder.compile(checkpointer=memory)
+        >>>     coro = graph.ainvoke(1, {"configurable": {"thread_id": "thread-1"}})
+        >>>     print(asyncio.run(coro))
         Output: 2
         ```
         Raw usage:
@@ -112,7 +111,7 @@ class AsyncSqliteSaver(BaseCheckpointSaver, AbstractAsyncContextManager):
         ...         saver = AsyncSqliteSaver(conn)
         ...         config = {"configurable": {"thread_id": "1"}}
         ...         checkpoint = {"ts": "2023-05-03T10:00:00Z", "data": {"key": "value"}}
-        ...         saved_config = await saver.aput(config, checkpoint)
+        ...         saved_config = await saver.aput(config, checkpoint, {}, {})
         ...         print(saved_config)
         >>> asyncio.run(main())
         {"configurable": {"thread_id": "1", "checkpoint_id": "0c62ca34-ac19-445d-bbb0-5b4984975b2a"}}
@@ -135,29 +134,20 @@ class AsyncSqliteSaver(BaseCheckpointSaver, AbstractAsyncContextManager):
         self.is_setup = False
 
     @classmethod
-    def from_conn_string(cls, conn_string: str) -> "AsyncSqliteSaver":
+    @asynccontextmanager
+    async def from_conn_string(
+        cls, conn_string: str
+    ) -> AsyncIterator["AsyncSqliteSaver"]:
         """Create a new AsyncSqliteSaver instance from a connection string.
 
         Args:
             conn_string (str): The SQLite connection string.
 
-        Returns:
+        Yields:
             AsyncSqliteSaver: A new AsyncSqliteSaver instance.
         """
-
-        return AsyncSqliteSaver(conn=aiosqlite.connect(conn_string))
-
-    async def __aenter__(self) -> Self:
-        return self
-
-    async def __aexit__(
-        self,
-        __exc_type: Optional[type[BaseException]],
-        __exc_value: Optional[BaseException],
-        __traceback: Optional[TracebackType],
-    ) -> Optional[bool]:
-        if self.is_setup:
-            return await self.conn.close()
+        async with aiosqlite.connect(conn_string) as conn:
+            yield AsyncSqliteSaver(conn)
 
     @not_implemented_sync_method
     def get_tuple(self, config: RunnableConfig) -> Optional[CheckpointTuple]:
@@ -384,6 +374,7 @@ class AsyncSqliteSaver(BaseCheckpointSaver, AbstractAsyncContextManager):
         config: RunnableConfig,
         checkpoint: Checkpoint,
         metadata: CheckpointMetadata,
+        new_versions: ChannelVersions,
     ) -> RunnableConfig:
         """Save a checkpoint to the database asynchronously.
 
@@ -394,6 +385,7 @@ class AsyncSqliteSaver(BaseCheckpointSaver, AbstractAsyncContextManager):
             config (RunnableConfig): The config to associate with the checkpoint.
             checkpoint (Checkpoint): The checkpoint to save.
             metadata (CheckpointMetadata): Additional metadata to save with the checkpoint.
+            new_versions (dict): New versions as of this write
 
         Returns:
             RunnableConfig: The updated config containing the saved checkpoint's timestamp.

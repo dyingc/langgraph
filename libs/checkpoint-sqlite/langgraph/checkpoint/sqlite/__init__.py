@@ -1,15 +1,14 @@
 import sqlite3
 import threading
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import contextmanager
 from hashlib import md5
-from types import TracebackType
 from typing import Any, AsyncIterator, Dict, Iterator, Optional, Sequence, Tuple
 
 from langchain_core.runnables import RunnableConfig
-from typing_extensions import Self
 
 from langgraph.checkpoint.base import (
     BaseCheckpointSaver,
+    ChannelVersions,
     Checkpoint,
     CheckpointMetadata,
     CheckpointTuple,
@@ -32,7 +31,7 @@ _AIO_ERROR_MSG = (
 )
 
 
-class SqliteSaver(BaseCheckpointSaver, AbstractContextManager):
+class SqliteSaver(BaseCheckpointSaver):
     """A checkpoint saver that stores checkpoints in a SQLite database.
 
     Note:
@@ -63,7 +62,7 @@ class SqliteSaver(BaseCheckpointSaver, AbstractContextManager):
         >>> graph.get_state(config)
         >>> result = graph.invoke(3, config)
         >>> graph.get_state(config)
-        StateSnapshot(values=4, next=(), config={'configurable': {'thread_id': '1', 'checkpoint_id': '0c62ca34-ac19-445d-bbb0-5b4984975b2a'}}, parent_config=None)
+        StateSnapshot(values=4, next=(), config={'configurable': {'thread_id': '1', 'checkpoint_ns': '', 'checkpoint_id': '0c62ca34-ac19-445d-bbb0-5b4984975b2a'}}, parent_config=None)
     """  # noqa
 
     conn: sqlite3.Connection
@@ -82,43 +81,34 @@ class SqliteSaver(BaseCheckpointSaver, AbstractContextManager):
         self.lock = threading.Lock()
 
     @classmethod
-    def from_conn_string(cls, conn_string: str) -> "SqliteSaver":
+    @contextmanager
+    def from_conn_string(cls, conn_string: str) -> Iterator["SqliteSaver"]:
         """Create a new SqliteSaver instance from a connection string.
 
         Args:
             conn_string (str): The SQLite connection string.
 
-        Returns:
+        Yields:
             SqliteSaver: A new SqliteSaver instance.
 
         Examples:
 
             In memory:
 
-                memory = SqliteSaver.from_conn_string(":memory:")
+                with SqliteSaver.from_conn_string(":memory:") as memory:
+                    ...
 
             To disk:
 
-                memory = SqliteSaver.from_conn_string("checkpoints.sqlite")
+                with SqliteSaver.from_conn_string("checkpoints.sqlite") as memory:
+                    ...
         """
-        return SqliteSaver(
-            conn=sqlite3.connect(
-                conn_string,
-                # https://ricardoanderegg.com/posts/python-sqlite-thread-safety/
-                check_same_thread=False,
-            )
-        )
-
-    def __enter__(self) -> Self:
-        return self
-
-    def __exit__(
-        self,
-        __exc_type: Optional[type[BaseException]],
-        __exc_value: Optional[BaseException],
-        __traceback: Optional[TracebackType],
-    ) -> Optional[bool]:
-        return self.conn.close()
+        with sqlite3.connect(
+            conn_string,
+            # https://ricardoanderegg.com/posts/python-sqlite-thread-safety/
+            check_same_thread=False,
+        ) as conn:
+            yield SqliteSaver(conn)
 
     def setup(self) -> None:
         """Set up the checkpoint database.
@@ -208,7 +198,8 @@ class SqliteSaver(BaseCheckpointSaver, AbstractContextManager):
             >>> config = {
             ...    "configurable": {
             ...        "thread_id": "1",
-            ...        "checkpoint_id": "2024-05-04T06:32:42.235444+00:00",
+           ...         "checkpoint_ns": "",
+            ...        "checkpoint_id": "1ef4f797-8335-6428-8001-8a1503f9b875",
             ...    }
             ... }
             >>> checkpoint_tuple = memory.get_tuple(config)
@@ -305,16 +296,18 @@ class SqliteSaver(BaseCheckpointSaver, AbstractContextManager):
 
         Examples:
             >>> from langgraph.checkpoint.sqlite import SqliteSaver
-            >>> memory = SqliteSaver.from_conn_string(":memory:")
+            >>> with SqliteSaver.from_conn_string(":memory:") as memory:
             ... # Run a graph, then list the checkpoints
-            >>> config = {"configurable": {"thread_id": "1"}}
-            >>> checkpoints = list(memory.list(config, limit=2))
+            >>>     config = {"configurable": {"thread_id": "1"}}
+            >>>     checkpoints = list(memory.list(config, limit=2))
             >>> print(checkpoints)
             [CheckpointTuple(...), CheckpointTuple(...)]
 
             >>> config = {"configurable": {"thread_id": "1"}}
-            >>> before = {"configurable": {"checkpoint_id": "2024-05-04T06:32:42.235444+00:00"}}
-            >>> checkpoints = list(memory.list(config, before=before))
+            >>> before = {"configurable": {"checkpoint_id": "1ef4f797-8335-6428-8001-8a1503f9b875"}}
+            >>> with SqliteSaver.from_conn_string(":memory:") as memory:
+            ... # Run a graph, then list the checkpoints
+            >>>     checkpoints = list(memory.list(config, before=before))
             >>> print(checkpoints)
             [CheckpointTuple(...), ...]
         """
@@ -364,6 +357,7 @@ class SqliteSaver(BaseCheckpointSaver, AbstractContextManager):
         config: RunnableConfig,
         checkpoint: Checkpoint,
         metadata: CheckpointMetadata,
+        new_versions: ChannelVersions,
     ) -> RunnableConfig:
         """Save a checkpoint to the database.
 
@@ -381,13 +375,12 @@ class SqliteSaver(BaseCheckpointSaver, AbstractContextManager):
         Examples:
 
             >>> from langgraph.checkpoint.sqlite import SqliteSaver
-            >>> memory = SqliteSaver.from_conn_string(":memory:")
-            ... # Run a graph, then list the checkpoints
-            >>> config = {"configurable": {"thread_id": "1"}}
-            >>> checkpoint = {"ts": "2024-05-04T06:32:42.235444+00:00", "data": {"key": "value"}}
-            >>> saved_config = memory.put(config, checkpoint, {"source": "input", "step": 1, "writes": {"key": "value"}})
+            >>> with SqliteSaver.from_conn_string(":memory:") as memory:
+            >>>     config = {"configurable": {"thread_id": "1", "checkpoint_ns": ""}}
+            >>>     checkpoint = {"ts": "2024-05-04T06:32:42.235444+00:00", "id": "1ef4f797-8335-6428-8001-8a1503f9b875", "data": {"key": "value"}}
+            >>>     saved_config = memory.put(config, checkpoint, {"source": "input", "step": 1, "writes": {"key": "value"}}, {})
             >>> print(saved_config)
-            {"configurable": {"thread_id": "1", "checkpoint_id": 2024-05-04T06:32:42.235444+00:00"}}
+            {'configurable': {'thread_id': '1', 'checkpoint_ns': '', 'checkpoint_id': '1ef4f797-8335-6428-8001-8a1503f9b875'}}
         """
         thread_id = config["configurable"]["thread_id"]
         checkpoint_ns = config["configurable"]["checkpoint_ns"]

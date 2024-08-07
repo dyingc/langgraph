@@ -1,12 +1,15 @@
 import asyncio
 from collections import defaultdict
+from contextlib import AbstractAsyncContextManager, AbstractContextManager
 from functools import partial
+from types import TracebackType
 from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Tuple
 
 from langchain_core.runnables import RunnableConfig
 
 from langgraph.checkpoint.base import (
     BaseCheckpointSaver,
+    ChannelVersions,
     Checkpoint,
     CheckpointMetadata,
     CheckpointTuple,
@@ -15,7 +18,9 @@ from langgraph.checkpoint.base import (
 )
 
 
-class MemorySaver(BaseCheckpointSaver):
+class MemorySaver(
+    BaseCheckpointSaver, AbstractContextManager, AbstractAsyncContextManager
+):
     """An in-memory checkpoint saver.
 
     This checkpoint saver stores checkpoints in memory using a defaultdict.
@@ -56,6 +61,28 @@ class MemorySaver(BaseCheckpointSaver):
         super().__init__(serde=serde)
         self.storage = defaultdict(lambda: defaultdict(dict))
         self.writes = defaultdict(list)
+
+    def __enter__(self) -> "MemorySaver":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Optional[type[BaseException]],
+        exc_value: Optional[BaseException],
+        traceback: Optional[TracebackType],
+    ) -> Optional[bool]:
+        return
+
+    async def __aenter__(self) -> "MemorySaver":
+        return self
+
+    async def __aexit__(
+        self,
+        __exc_type: Optional[type[BaseException]],
+        __exc_value: Optional[BaseException],
+        __traceback: Optional[TracebackType],
+    ) -> Optional[bool]:
+        return
 
     def get_tuple(self, config: RunnableConfig) -> Optional[CheckpointTuple]:
         """Get a checkpoint tuple from the in-memory storage.
@@ -203,6 +230,7 @@ class MemorySaver(BaseCheckpointSaver):
         config: RunnableConfig,
         checkpoint: Checkpoint,
         metadata: CheckpointMetadata,
+        new_versions: ChannelVersions,
     ) -> RunnableConfig:
         """Save a checkpoint to the in-memory storage.
 
@@ -213,6 +241,7 @@ class MemorySaver(BaseCheckpointSaver):
             config (RunnableConfig): The config to associate with the checkpoint.
             checkpoint (Checkpoint): The checkpoint to save.
             metadata (CheckpointMetadata): Additional metadata to save with the checkpoint.
+            new_versions (dict): New versions as of this write
 
         Returns:
             RunnableConfig: The updated config containing the saved checkpoint's timestamp.
@@ -315,6 +344,7 @@ class MemorySaver(BaseCheckpointSaver):
         config: RunnableConfig,
         checkpoint: Checkpoint,
         metadata: CheckpointMetadata,
+        new_versions: ChannelVersions,
     ) -> RunnableConfig:
         """Asynchronous version of put.
 
@@ -322,12 +352,13 @@ class MemorySaver(BaseCheckpointSaver):
             config (RunnableConfig): The config to associate with the checkpoint.
             checkpoint (Checkpoint): The checkpoint to save.
             metadata (CheckpointMetadata): Additional metadata to save with the checkpoint.
+            new_versions (dict): New versions as of this write
 
         Returns:
             RunnableConfig: The updated config containing the saved checkpoint's timestamp.
         """
         return await asyncio.get_running_loop().run_in_executor(
-            None, self.put, config, checkpoint, metadata
+            None, self.put, config, checkpoint, metadata, new_versions
         )
 
     async def aput_writes(
