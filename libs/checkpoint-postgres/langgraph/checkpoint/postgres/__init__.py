@@ -61,12 +61,12 @@ class PostgresSaver(BasePostgresSaver):
     def setup(self) -> None:
         """Set up the checkpoint database asynchronously.
 
-        This method creates the necessary tables in the SQLite database if they don't
-        already exist. It is called automatically when needed and should not be called
-        directly by the user.
+        This method creates the necessary tables in the Postgres database if they don't
+        already exist and runs database migrations. It MUST be called directly by the user
+        the first time checkpointer is used.
         """
         with self.lock:
-            with self.conn.cursor(binary=True) as cur:
+            with self.conn.cursor(binary=True, row_factory=dict_row) as cur:
                 try:
                     version = cur.execute(
                         "SELECT v FROM checkpoint_migrations ORDER BY v DESC LIMIT 1"
@@ -90,37 +90,106 @@ class PostgresSaver(BasePostgresSaver):
         before: Optional[RunnableConfig] = None,
         limit: Optional[int] = None,
     ) -> Iterator[CheckpointTuple]:
+        """List checkpoints from the database.
+
+        This method retrieves a list of checkpoint tuples from the Postgres database based
+        on the provided config. The checkpoints are ordered by checkpoint ID in descending order (newest first).
+
+        Args:
+            config (RunnableConfig): The config to use for listing the checkpoints.
+            filter (Optional[Dict[str, Any]]): Additional filtering criteria for metadata. Defaults to None.
+            before (Optional[RunnableConfig]): If provided, only checkpoints before the specified checkpoint ID are returned. Defaults to None.
+            limit (Optional[int]): The maximum number of checkpoints to return. Defaults to None.
+
+        Yields:
+            Iterator[CheckpointTuple]: An iterator of checkpoint tuples.
+
+        Examples:
+            >>> from langgraph.checkpoint.postgres import PostgresSaver
+            >>> DB_URI = "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable"
+            >>> with PostgresSaver.from_conn_string(DB_URI) as memory:
+            ... # Run a graph, then list the checkpoints
+            >>>     config = {"configurable": {"thread_id": "1"}}
+            >>>     checkpoints = list(memory.list(config, limit=2))
+            >>> print(checkpoints)
+            [CheckpointTuple(...), CheckpointTuple(...)]
+
+            >>> config = {"configurable": {"thread_id": "1"}}
+            >>> before = {"configurable": {"checkpoint_id": "1ef4f797-8335-6428-8001-8a1503f9b875"}}
+            >>> with PostgresSaver.from_conn_string(DB_URI) as memory:
+            ... # Run a graph, then list the checkpoints
+            >>>     checkpoints = list(memory.list(config, before=before))
+            >>> print(checkpoints)
+            [CheckpointTuple(...), ...]
+        """
         where, args = self._search_where(config, filter, before)
         query = self.SELECT_SQL + where + " ORDER BY checkpoint_id DESC"
         if limit:
             query += f" LIMIT {limit}"
         # if we change this to use .stream() we need to make sure to close the cursor
-        for value in self.conn.execute(query, args, binary=True):
-            yield CheckpointTuple(
-                {
-                    "configurable": {
-                        "thread_id": value["thread_id"],
-                        "checkpoint_ns": value["checkpoint_ns"],
-                        "checkpoint_id": value["checkpoint_id"],
+        with self._cursor() as cur:
+            cur.execute(query, args, binary=True)
+            for value in cur:
+                yield CheckpointTuple(
+                    {
+                        "configurable": {
+                            "thread_id": value["thread_id"],
+                            "checkpoint_ns": value["checkpoint_ns"],
+                            "checkpoint_id": value["checkpoint_id"],
+                        }
+                    },
+                    {
+                        **self._load_checkpoint(value["checkpoint"]),
+                        "channel_values": self._load_blobs(value["channel_values"]),
+                    },
+                    self._load_metadata(value["metadata"]),
+                    {
+                        "configurable": {
+                            "thread_id": value["thread_id"],
+                            "checkpoint_ns": value["checkpoint_ns"],
+                            "checkpoint_id": value["parent_checkpoint_id"],
+                        }
                     }
-                },
-                {
-                    **self._load_checkpoint(value["checkpoint"]),
-                    "channel_values": self._load_blobs(value["channel_values"]),
-                },
-                self._load_metadata(value["metadata"]),
-                {
-                    "configurable": {
-                        "thread_id": value["thread_id"],
-                        "checkpoint_ns": value["checkpoint_ns"],
-                        "checkpoint_id": value["parent_checkpoint_id"],
-                    }
-                }
-                if value["parent_checkpoint_id"]
-                else None,
-            )
+                    if value["parent_checkpoint_id"]
+                    else None,
+                    self._load_writes(value["pending_writes"]),
+                )
 
     def get_tuple(self, config: RunnableConfig) -> Optional[CheckpointTuple]:
+        """Get a checkpoint tuple from the database.
+
+        This method retrieves a checkpoint tuple from the Postgres database based on the
+        provided config. If the config contains a "checkpoint_id" key, the checkpoint with
+        the matching thread ID and timestamp is retrieved. Otherwise, the latest checkpoint
+        for the given thread ID is retrieved.
+
+        Args:
+            config (RunnableConfig): The config to use for retrieving the checkpoint.
+
+        Returns:
+            Optional[CheckpointTuple]: The retrieved checkpoint tuple, or None if no matching checkpoint was found.
+
+        Examples:
+
+            Basic:
+            >>> config = {"configurable": {"thread_id": "1"}}
+            >>> checkpoint_tuple = memory.get_tuple(config)
+            >>> print(checkpoint_tuple)
+            CheckpointTuple(...)
+
+            With timestamp:
+
+            >>> config = {
+            ...    "configurable": {
+            ...        "thread_id": "1",
+            ...        "checkpoint_ns": "",
+            ...        "checkpoint_id": "1ef4f797-8335-6428-8001-8a1503f9b875",
+            ...    }
+            ... }
+            >>> checkpoint_tuple = memory.get_tuple(config)
+            >>> print(checkpoint_tuple)
+            CheckpointTuple(...)
+        """  # noqa
         thread_id = config["configurable"]["thread_id"]
         checkpoint_id = get_checkpoint_id(config)
         checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
@@ -132,7 +201,7 @@ class PostgresSaver(BasePostgresSaver):
             where = "WHERE thread_id = %s AND checkpoint_ns = %s ORDER BY checkpoint_id DESC LIMIT 1"
 
         with self._cursor() as cur:
-            cur = self.conn.execute(
+            cur.execute(
                 self.SELECT_SQL + where,
                 args,
                 binary=True,
@@ -171,6 +240,31 @@ class PostgresSaver(BasePostgresSaver):
         metadata: CheckpointMetadata,
         new_versions: ChannelVersions,
     ) -> RunnableConfig:
+        """Save a checkpoint to the database.
+
+        This method saves a checkpoint to the Postgres database. The checkpoint is associated
+        with the provided config and its parent config (if any).
+
+        Args:
+            config (RunnableConfig): The config to associate with the checkpoint.
+            checkpoint (Checkpoint): The checkpoint to save.
+            metadata (CheckpointMetadata): Additional metadata to save with the checkpoint.
+            new_versions (ChannelVersions): New channel versions as of this write.
+
+        Returns:
+            RunnableConfig: Updated configuration after storing the checkpoint.
+
+        Examples:
+
+            >>> from langgraph.checkpoint.postgres import PostgresSaver
+            >>> DB_URI = "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable"
+            >>> with PostgresSaver.from_conn_string(DB_URI) as memory:
+            >>>     config = {"configurable": {"thread_id": "1", "checkpoint_ns": ""}}
+            >>>     checkpoint = {"ts": "2024-05-04T06:32:42.235444+00:00", "id": "1ef4f797-8335-6428-8001-8a1503f9b875", "data": {"key": "value"}}
+            >>>     saved_config = memory.put(config, checkpoint, {"source": "input", "step": 1, "writes": {"key": "value"}}, {})
+            >>> print(saved_config)
+            {'configurable': {'thread_id': '1', 'checkpoint_ns': '', 'checkpoint_id': '1ef4f797-8335-6428-8001-8a1503f9b875'}}
+        """
         configurable = config["configurable"].copy()
         thread_id = configurable.pop("thread_id")
         checkpoint_ns = configurable.pop("checkpoint_ns")
@@ -216,7 +310,16 @@ class PostgresSaver(BasePostgresSaver):
         writes: List[tuple[str, Any]],
         task_id: str,
     ) -> None:
-        with self._cursor() as cur:
+        """Store intermediate writes linked to a checkpoint.
+
+        This method saves intermediate writes associated with a checkpoint to the Postgres database.
+
+        Args:
+            config (RunnableConfig): Configuration of the related checkpoint.
+            writes (List[Tuple[str, Any]]): List of writes to store.
+            task_id (str): Identifier for the task creating the writes.
+        """
+        with self._cursor(pipeline=True) as cur:
             cur.executemany(
                 self.UPSERT_CHECKPOINT_WRITES_SQL,
                 self._dump_writes(
@@ -235,7 +338,7 @@ class PostgresSaver(BasePostgresSaver):
             # in multiple threads/coroutines, but only one cursor can be
             # used at a time
             try:
-                with self.conn.cursor(binary=True) as cur:
+                with self.conn.cursor(binary=True, row_factory=dict_row) as cur:
                     yield cur
             finally:
                 if pipeline:
@@ -243,8 +346,10 @@ class PostgresSaver(BasePostgresSaver):
         elif pipeline:
             # a connection not in pipeline mode can only be used by one
             # thread/coroutine at a time, so we acquire a lock
-            with self.lock, self.conn.pipeline(), self.conn.cursor(binary=True) as cur:
+            with self.lock, self.conn.pipeline(), self.conn.cursor(
+                binary=True, row_factory=dict_row
+            ) as cur:
                 yield cur
         else:
-            with self.lock, self.conn.cursor(binary=True) as cur:
+            with self.lock, self.conn.cursor(binary=True, row_factory=dict_row) as cur:
                 yield cur
